@@ -1,0 +1,358 @@
+---
+title: "Claims prediction"
+author: "Sebastian Günther"
+date: "2024-05-14"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+library(farff)
+library(tidyverse)
+library(knitr)
+library(mgcv)
+library(xgboost)
+library(vtable)
+
+options(scipen=999)
+```
+
+## Load data
+
+
+```{r load, echo=TRUE, include=TRUE}
+claims <- farff::readARFF("freMTPL2sev.arff")
+attributes <- farff::readARFF("freMTPL2freq.arff")
+```
+
+## Prepare data
+
+
+```{r join_and_prepare_data, echo=TRUE, include=TRUE}
+claims_aggregated <-claims %>% group_by(IDpol) %>% summarize(number_of_claims = n(), SumClaimAmount = sum(ClaimAmount))
+
+merged_df <- attributes %>% left_join(claims_aggregated, by = "IDpol")
+
+merged_df <- merged_df %>% mutate(SumClaimAmount = ifelse(is.na(SumClaimAmount), 0, SumClaimAmount),
+                                  number_of_claims = ifelse(is.na(number_of_claims), 0, number_of_claims),
+                                  )
+
+merged_df <- merged_df %>% filter(!(ClaimNb > 0 & SumClaimAmount == 0))
+merged_df <- merged_df %>% filter(number_of_claims==ClaimNb) %>% select(-number_of_claims) 
+
+
+cleansed_df <- merged_df %>% filter(Exposure <= 1)
+```
+
+
+
+```{r make_adjustments, echo=TRUE, include=TRUE}
+filtered_df <- cleansed_df %>% mutate(ExpectedAverageClaimAmount = SumClaimAmount / ClaimNb) %>% select(-SumClaimAmount)
+
+filtered_df <- filtered_df %>% mutate(ExpectedAverageClaimAmount = ifelse(is.na(ExpectedAverageClaimAmount), 0, ExpectedAverageClaimAmount))
+
+trim_dpv <- quantile(filtered_df$ExpectedAverageClaimAmount, 0.99999)
+filtered_df <- filtered_df %>% mutate(ExpectedAverageClaimAmount = ifelse(ExpectedAverageClaimAmount> trim_dpv, trim_dpv, ExpectedAverageClaimAmount))
+```
+
+## Data Exploration
+
+
+
+```{r check, echo=TRUE, include=TRUE}
+sumtable(filtered_df, factor.counts=FALSE)
+
+ggplot(filtered_df) + geom_histogram(aes(x=ExpectedAverageClaimAmount*ClaimNb/Exposure)) + scale_x_log10() + xlab("Projected annual claim amount per contract") + ylab("Count")
+ggplot(filtered_df) + geom_histogram(aes(x=ClaimNb)) + xlab("Claims per contract") + ylab("Count")
+```
+# Impact of age
+
+```{r impact_age, echo=TRUE, include=TRUE}
+age_impact <- filtered_df %>% group_by(DrivAge) %>% summarise(mean_costs = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure), mean_claims = mean(ClaimNb/Exposure))
+
+ggplot(age_impact %>% filter(mean_costs!=0), aes(x=DrivAge, y=mean_costs)) + geom_point() + geom_smooth() + scale_y_log10() + ylab("Projected average annual costs per contract")
+
+ggplot(age_impact %>% filter(mean_costs!=0), aes(x=DrivAge, y=mean_claims)) + geom_point() + geom_smooth() + scale_y_log10() + ylab("Projected average claims per contract")
+
+cor.test(filtered_df$ClaimNb, filtered_df$Exposure)
+cor.test(filtered_df$ExpectedAverageClaimAmount, filtered_df$Exposure)
+cor.test(filtered_df$ExpectedAverageClaimAmount, filtered_df$ClaimNb)
+```
+
+# Impact of location
+
+```{r impact_location, echo=TRUE, include=TRUE}
+region_impact <- filtered_df %>% group_by(Region, Area) %>% summarise(mean = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure))
+
+ggplot(region_impact, aes(x=Region, y=mean))  + geom_point()  + geom_smooth() + facet_wrap(~Area,nrow = 3) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + scale_y_log10() + ylab("Projected average annual costs per contract")
+
+```
+
+# Impact of vehiclepower
+
+
+```{r impact_vehiclepower, echo=TRUE, include=TRUE}
+vehicle_power <- filtered_df %>%  group_by(VehPower, VehBrand) %>% summarise(mean = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure))
+ggplot(vehicle_power, aes(x=VehPower, y=mean)) + geom_point() + geom_smooth() + scale_y_log10()+ facet_wrap(~VehBrand) + ylab("Projected average annual costs per contract")
+```
+
+
+## Prepare regression analyses
+
+```{r prepare_regression, echo=TRUE, include=TRUE}
+
+regression_data <- filtered_df  %>% mutate(Area = factor(Area), 
+                                    VehBrand = factor(VehBrand),
+                                    VehGas = factor(VehGas),
+                                    Region = factor(Region)) %>% 
+                                    select(-c(IDpol)) 
+
+
+num_bins_wo_zero <- 4
+regression_data$bin_var <- cut(regression_data$ExpectedAverageClaimAmount, breaks = num_bins_wo_zero, labels = FALSE, include.lowest = FALSE)
+regression_data$bin_var <- ifelse(regression_data$ExpectedAverageClaimAmount==0, 0, regression_data$bin_var)
+
+create_equal_bin_samples <- function(data, bin_var, sample_size) {
+  bins <- split(data, data[[bin_var]], drop = FALSE)
+  
+  sample1 <- list()
+  sample2 <- list()
+  
+  for (bin in bins) {
+    bin <- bin[sample(nrow(bin)),]
+    
+    half_size <- floor(nrow(bin) / 2)
+    
+    if (nrow(bin) %% 2 == 1) {
+      sample1 <- append(sample1, list(bin[1:(half_size + 1), ]))
+      sample2 <- append(sample2, list(bin[(half_size + 2):nrow(bin), ]))
+    } else {
+      sample1 <- append(sample1, list(bin[1:half_size, ]))
+      sample2 <- append(sample2, list(bin[(half_size + 1):nrow(bin), ]))
+    }
+  }
+  
+  sample1 <- do.call(rbind, sample1)
+  sample2 <- do.call(rbind, sample2)
+  
+  return(list(train = sample1, test = sample2))
+}
+
+set.seed(137)
+samples <- create_equal_bin_samples(regression_data, "bin_var", sample_size = 50)
+
+```
+
+
+## Claim frequency model
+
+```{r predict_frequencies, echo=TRUE, include=TRUE}
+train <- samples[["train"]] %>% mutate(expected_claims = ClaimNb / Exposure)
+test <- samples[["test"]] %>% mutate(expected_claims = ClaimNb / Exposure)
+
+baseline_model <- glm(ClaimNb ~ BonusMalus+ VehBrand + VehGas + Density + Region +
+ Area +  VehPower + VehAge + DrivAge, family = poisson(), data = train , offset = log(Exposure))
+
+paste("Explanatory power:", with(summary(baseline_model), 1 - deviance/null.deviance))
+
+knitr::kable(broom::tidy(baseline_model))
+```
+
+
+```{r evaluate_frequency, echo=TRUE, include=TRUE}
+evaluate_frequency_model <- function(test, train, predictions){
+  test <- test %>% cbind(data.frame(predicted_claims=predictions)) 
+  test <- test %>% mutate(ae = abs(predicted_claims - ClaimNb),
+                          baseline_ae = abs(mean(train$ClaimNb) - ClaimNb))
+  return(list(mae=mean(test$ae),
+              baseline_mae= mean(test$baseline_ae)))
+}
+
+plot_based_on_group_frequency <- function(data, prediction, group, plottitle){
+  group_factor <- dplyr::enquo(group)
+  data <- data %>% cbind(data.frame(predicted_claims=prediction)) 
+  
+  plot_data <- data %>% rename(actual = ClaimNb, predicted = predicted_claims) %>% 
+                        group_by(!!group_factor) %>% 
+                        summarize(mean_predicted = mean(predicted),
+                                  mean_actual = mean(actual)) %>%
+                        tidyr::pivot_longer(cols=c(mean_predicted, mean_actual))
+  
+  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ylab("Claims per year")
+}
+
+# set exposure to 1 to predict annual claim frequencies
+frequency_test_predictions <- predict(baseline_model, test %>% mutate(Exposure = 1), type="response")
+
+#evaluate model, normalize ClaimNb based on Exposure to scale to one year for each contract
+evaluate_frequency_model(test %>% mutate(ClaimNb = ClaimNb/Exposure),
+                         train %>% mutate(ClaimNb = ClaimNb/Exposure),
+                         frequency_test_predictions)
+
+plot_based_on_group_frequency(test%>% mutate(ClaimNb = ClaimNb/Exposure), frequency_test_predictions, DrivAge, "DriveAge distribution")
+plot_based_on_group_frequency(test%>% mutate(ClaimNb = ClaimNb/Exposure), frequency_test_predictions, VehAge, "VehAge distribution")
+plot_based_on_group_frequency(test%>% mutate(ClaimNb = ClaimNb/Exposure), frequency_test_predictions, BonusMalus,"BonusMalus distribution")
+```
+
+
+## Severity model (per claim)
+
+
+```{r severity_predict_and_evaluate_base, echo=TRUE, include=TRUE}
+evaluate_severity_prediction <- function(test_data, train_data, prediction){
+test_data <- test_data %>% cbind(data.frame(prediction_severity  = prediction))
+     
+test_data <- test_data %>% mutate(predicted_costs = prediction_severity)
+
+test_data <- test_data %>%  mutate(ae = abs(predicted_costs-ExpectedAverageClaimAmount),
+                      baseline_ae = abs(mean(train_data$ExpectedAverageClaimAmount)-ExpectedAverageClaimAmount)) 
+return(list(mae = mean(test_data$ae),
+            baseline_mae = mean(test_data$baseline_ae)))
+}
+
+plot_based_on_group_severity <- function(data, prediction, group, plottitle){
+  group_factor <- dplyr::enquo(group)
+  data <- data %>% cbind(data.frame(predicted=prediction)) 
+  plot_data <- data %>% group_by(!!group_factor) %>% 
+                        summarize(mean_predicted = mean(predicted),
+                                  mean_actual = mean(ExpectedAverageClaimAmount)) %>%
+                        tidyr::pivot_longer(cols=c(mean_predicted, mean_actual))
+  
+  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ylab("Costs per Claim")
+}
+
+
+
+train_claims = train %>% filter(ExpectedAverageClaimAmount > 0)
+test_claims = test  %>% filter(ExpectedAverageClaimAmount > 0)
+
+ridge_model <- gam(ExpectedAverageClaimAmount ~ VehPower + VehAge + DrivAge +
+ BonusMalus+ VehBrand + VehGas + Density + Region +
+ Area,  family = Gamma(link = "log"), data = train_claims, weights = train_claims$ClaimNb / train_claims$Exposure)
+
+summary(ridge_model)
+
+test_severity_prediction <- predict(ridge_model, test_claims, type="response")
+evaluate_severity_prediction(test_claims, train_claims, test_severity_prediction)
+
+plot_based_on_group_severity(test_claims, test_severity_prediction, DrivAge, "DrivAge distribution")
+plot_based_on_group_severity(test_claims, test_severity_prediction, VehAge, "VehAge distribution")
+plot_based_on_group_severity(test_claims, test_severity_prediction, BonusMalus, "BonusMalus distribution")
+```
+
+```{r severity_predict_and_evaluate_xgboost, echo=TRUE, include=TRUE}
+
+train_xgboost <- train_claims
+test_xgboost <- test_claims
+
+train_matrix <- model.matrix(~ . - 1, data = subset(train_xgboost, select = -c(ExpectedAverageClaimAmount, bin_var, Exposure, ClaimNb, expected_claims)))
+test_matrix <- model.matrix(~ . - 1, data = subset(test_xgboost, select = -c(ExpectedAverageClaimAmount, bin_var, Exposure, ClaimNb, expected_claims)))
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_xgboost$ExpectedAverageClaimAmount, weight=train_xgboost$ClaimNb/train_xgboost$Exposure)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_xgboost$ExpectedAverageClaimAmount, weight=test_xgboost$ClaimNb/test_xgboost$Exposure)
+
+
+
+params <- list(
+  eta = 0.01,
+  nthread = -1,
+  objective = "reg:gamma",
+  eval_metric = "mae"
+)
+
+
+watchlist <- list(train = dtrain, test = dtest)
+
+
+
+bstSparse <- xgb.train(params = params,
+                       data = dtrain,
+                       nrounds = 850,
+                       watchlist = watchlist,
+                       verbose=0,
+                       print_every_n = 50)
+
+
+
+test_severity_prediction_xboost <- predict(bstSparse, dtest, type="response")
+evaluate_severity_prediction(test_xgboost, train_xgboost, test_severity_prediction_xboost)
+
+```
+
+## Combined models (costs per year)
+
+```{r combined_analyse_both_models, echo=TRUE, include=TRUE}
+evaluate_combined_prediction <- function(test_data, train_data, claimprediction, severityprediction, modelname){
+test_data <- test_data %>% cbind(data.frame(prediction_severity  = severityprediction, prediction_claim = claimprediction)) 
+     
+test_data <- test_data %>% mutate(predicted_costs_per_year = prediction_severity*prediction_claim)
+
+
+test_data <- test_data %>%  mutate(ae = abs(predicted_costs_per_year-ExpectedAverageClaimAmount * ClaimNb/Exposure),
+                                  baseline_ae = abs(ExpectedAverageClaimAmount * ClaimNb/Exposure - mean(train_data$ExpectedAverageClaimAmount * train_data$ClaimNb /  train_data$Exposure))) 
+
+actual_claims <- test_data %>% filter(ExpectedAverageClaimAmount > 0)
+
+return(list(modelname_severity = modelname,
+            mae_all = mean(test_data$ae),
+            baseline_mae_all = mean(test_data$baseline_ae),
+            actual_claims_mae = mean(actual_claims$ae),
+            baseline_claims_mae = mean(actual_claims$baseline_ae),
+            overall_test_data = invisible(test_data),
+            claim_test_data =invisible(actual_claims),
+            train_data =invisible(train_data)
+            ))
+}
+
+#again, estimate claims after one year, therefore we set exposure to 1
+frequency_test_predictions <- predict(baseline_model, test %>% mutate(Exposure = 1), type="response")
+test_severity_prediction_ridge <- predict(ridge_model, test, type="response")
+
+combined_ridge <- evaluate_combined_prediction(test, train, frequency_test_predictions, test_severity_prediction_ridge, "ridge")
+
+
+test_matrix <- model.matrix(~ . - 1, data = subset(test, select = -c(ExpectedAverageClaimAmount, bin_var, Exposure, ClaimNb, expected_claims)))
+dtest <- xgb.DMatrix(data = test_matrix, label = test$ExpectedAverageClaimAmount, weight=test$ClaimNb/test$Exposure)
+test_severity_prediction <- predict(bstSparse, dtest, type="response")
+
+train_matrix <- model.matrix(~ . - 1, data = subset(train, select = -c(ExpectedAverageClaimAmount, bin_var, Exposure, ClaimNb, expected_claims)))
+dtrain <- xgb.DMatrix(data = train_matrix, label = train$ExpectedAverageClaimAmount, weight=train$ClaimNb/train$Exposure)
+train_severity_prediction <- predict(bstSparse, dtest, type="response")
+
+combined_xgboost <- evaluate_combined_prediction(test, train, frequency_test_predictions, test_severity_prediction, "xgboost")
+combined_ridge[-c(6, 7, 8)]
+combined_xgboost[-c(6,7, 8)]
+
+paste("Average projected annual costs in train set", mean(train$ExpectedAverageClaimAmount * train$ClaimNb /  train$Exposure))
+paste("Average predicted annual costs in train set (xgboost)", mean(train_severity_prediction*frequency_test_predictions))
+
+```
+
+
+```{r debug_combined_prediction, echo=TRUE, include=TRUE}
+
+plot_based_on_group_combined_models <- function(data, group, plottitle){
+  group_factor <- dplyr::enquo(group)
+  plot_data <- data[["overall_test_data"]] %>% group_by(!!group_factor) %>% 
+                      summarize(mean_predicted = mean(predicted_costs_per_year),
+                             mean_actual = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure)
+                             ) %>% tidyr::pivot_longer(cols=c(mean_predicted, mean_actual))
+  
+  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(formula = 'y ~ x', method = 'loess', aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ggplot2::ylab("Costs per year in EUR") + ggplot2::geom_hline(yintercept = mean(data[["train_data"]]$ExpectedAverageClaimAmount * data[["train_data"]]$ClaimNb / data[["train_data"]]$Exposure), linetype="dashed", color="brown")
+}
+
+
+plot_based_on_group_combined_models(combined_ridge, DrivAge, "DriveAge distribution, ridge regression")
+plot_based_on_group_combined_models(combined_xgboost, DrivAge, "DriveAge distribution, xgboost regression")
+
+
+plot_based_on_group_combined_models(combined_ridge, BonusMalus, "BonusMalus distribution, ridge regression")
+plot_based_on_group_combined_models(combined_xgboost, BonusMalus, "BonusMalus distribution, xgboost regression")
+
+
+plot_based_on_group_combined_models(combined_ridge, VehAge, "VehAge distribution, ridge regression")
+plot_based_on_group_combined_models(combined_xgboost, VehAge, "VehAge distribution, xgboost regression")
+```
+
