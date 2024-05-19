@@ -72,7 +72,7 @@ ggplot(filtered_df) + geom_histogram(aes(x=ClaimNb)) + xlab("Claims per contract
 ```{r impact_age, echo=TRUE, include=TRUE}
 age_impact <- filtered_df %>% group_by(DrivAge) %>% summarise(mean_costs = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure), mean_claims = mean(ClaimNb/Exposure))
 
-ggplot(age_impact %>% filter(mean_costs!=0), aes(x=DrivAge, y=mean_costs)) + geom_point() + geom_smooth() + scale_y_log10() + ylab("Projected average annual costs per contract")
+ggplot(age_impact %>% filter(mean_costs!=0), aes(x=DrivAge, y=mean_costs)) + geom_point() + geom_smooth() + scale_y_log10() + ylab("Projected average annual claim amount per contract")
 
 ggplot(age_impact %>% filter(mean_costs!=0), aes(x=DrivAge, y=mean_claims)) + geom_point() + geom_smooth() + scale_y_log10() + ylab("Projected average claims per contract")
 
@@ -95,7 +95,7 @@ ggplot(region_impact, aes(x=Region, y=mean))  + geom_point()  + geom_smooth() + 
 
 ```{r impact_vehiclepower, echo=TRUE, include=TRUE}
 vehicle_power <- filtered_df %>%  group_by(VehPower, VehBrand) %>% summarise(mean = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure))
-ggplot(vehicle_power, aes(x=VehPower, y=mean)) + geom_point() + geom_smooth() + scale_y_log10()+ facet_wrap(~VehBrand) + ylab("Projected average annual costs per contract")
+ggplot(vehicle_power, aes(x=VehPower, y=mean)) + geom_point() + geom_smooth() + scale_y_log10()+ facet_wrap(~VehBrand) + ylab("Projected average annual claim amount per contract")
 ```
 
 
@@ -220,7 +220,7 @@ plot_based_on_group_severity <- function(data, prediction, group, plottitle){
                                   mean_actual = mean(ExpectedAverageClaimAmount)) %>%
                         tidyr::pivot_longer(cols=c(mean_predicted, mean_actual))
   
-  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ylab("Costs per Claim")
+  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ylab("Average amount per claim")
 }
 
 
@@ -281,7 +281,7 @@ evaluate_severity_prediction(test_xgboost, train_xgboost, test_severity_predicti
 
 ```
 
-## Combined models (costs per year)
+## Combined models (claim amount per year)
 
 ```{r combined_analyse_both_models, echo=TRUE, include=TRUE}
 evaluate_combined_prediction <- function(test_data, train_data, claimprediction, severityprediction, modelname){
@@ -325,8 +325,8 @@ combined_xgboost <- evaluate_combined_prediction(test, train, frequency_test_pre
 combined_ridge[-c(6, 7, 8)]
 combined_xgboost[-c(6,7, 8)]
 
-paste("Average projected annual costs in train set", mean(train$ExpectedAverageClaimAmount * train$ClaimNb /  train$Exposure))
-paste("Average predicted annual costs in train set (xgboost)", mean(train_severity_prediction*frequency_test_predictions))
+paste("Average projected annual claim amount in train set", mean(train$ExpectedAverageClaimAmount * train$ClaimNb /  train$Exposure))
+paste("Average predicted annual claim amount in train set (xgboost)", mean(train_severity_prediction*frequency_test_predictions))
 
 ```
 
@@ -340,7 +340,7 @@ plot_based_on_group_combined_models <- function(data, group, plottitle){
                              mean_actual = mean(ExpectedAverageClaimAmount*ClaimNb/Exposure)
                              ) %>% tidyr::pivot_longer(cols=c(mean_predicted, mean_actual))
   
-  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(formula = 'y ~ x', method = 'loess', aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ggplot2::ylab("Costs per year in EUR") + ggplot2::geom_hline(yintercept = mean(data[["train_data"]]$ExpectedAverageClaimAmount * data[["train_data"]]$ClaimNb / data[["train_data"]]$Exposure), linetype="dashed", color="brown")
+  ggplot(plot_data) + geom_point(aes(x=!!group_factor, y=value)) + ggplot2::ggtitle(plottitle) + stat_smooth(formula = 'y ~ x', method = 'loess', aes(x=!!group_factor, y=value)) + facet_wrap(~name) + ggplot2::ylab("Claim amount per year") + ggplot2::geom_hline(yintercept = mean(data[["train_data"]]$ExpectedAverageClaimAmount * data[["train_data"]]$ClaimNb / data[["train_data"]]$Exposure), linetype="dashed", color="brown")
 }
 
 
